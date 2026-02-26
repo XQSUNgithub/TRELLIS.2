@@ -30,7 +30,6 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     """
     model_names_to_load = [
         'sparse_structure_flow_model',
-        'sparse_structure_encoder',
         'sparse_structure_decoder',
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
@@ -241,25 +240,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return coords
 
     @torch.no_grad()
-    def encode_sparse_structure_latent(
+    def load_sparse_structure_latent(
         self,
-        sparse_voxel: torch.Tensor,
-        sample_posterior: bool = False,
+        latent_path: str,
     ) -> torch.Tensor:
         """
-        Encode sparse structure occupancy into sparse structure latent (x_0).
+        Load sparse structure latent from npz file.
 
         Args:
-            sparse_voxel (torch.Tensor): Occupancy tensor with shape [N, 1, R, R, R].
-            sample_posterior (bool): Whether to sample posterior in VAE encoder.
+            latent_path (str): Path to a processed ss latent npz file that contains key 'z'.
         """
-        assert 'sparse_structure_encoder' in self.models, "No sparse_structure_encoder found in pipeline models."
-        encoder = self.models['sparse_structure_encoder']
-        if self.low_vram:
-            encoder.to(self.device)
-        x_0 = encoder(sparse_voxel.to(self.device), sample_posterior=sample_posterior)
-        if self.low_vram:
-            encoder.cpu()
+        latent = np.load(latent_path)
+        assert 'z' in latent, f"Invalid ss latent file (missing 'z'): {latent_path}"
+        x_0 = torch.tensor(latent['z']).float()
+        if x_0.ndim == 4:
+            x_0 = x_0[None]
         return x_0
 
     @torch.no_grad()
@@ -554,7 +549,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
         sparse_structure_latent: Optional[torch.Tensor] = None,
-        sparse_structure_voxel: Optional[torch.Tensor] = None,
+        sparse_structure_latent_path: Optional[str] = None,
         use_sparse_structure_inversion: bool = False,
         sparse_structure_inversion_sampler_params: dict = {},
     ) -> List[MeshWithVoxel]:
@@ -573,7 +568,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
             sparse_structure_latent (torch.Tensor): Optional sparse structure latent x_0 used for inversion.
-            sparse_structure_voxel (torch.Tensor): Optional sparse occupancy [N, 1, R, R, R] to encode into x_0 before inversion.
+            sparse_structure_latent_path (str): Optional path to processed ss_latents/*.npz used for inversion.
             use_sparse_structure_inversion (bool): If True, invert x_0 to noise and then sample sparse structure from this noise.
             sparse_structure_inversion_sampler_params (dict): Additional sampler params for inversion.
         """
@@ -605,10 +600,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         ss_init_noise = None
         if use_sparse_structure_inversion:
-            assert (sparse_structure_latent is not None) ^ (sparse_structure_voxel is not None), \
-                "Provide exactly one of sparse_structure_latent or sparse_structure_voxel when use_sparse_structure_inversion=True"
+            assert (sparse_structure_latent is not None) ^ (sparse_structure_latent_path is not None), \
+                "Provide exactly one of sparse_structure_latent or sparse_structure_latent_path when use_sparse_structure_inversion=True"
             if sparse_structure_latent is None:
-                sparse_structure_latent = self.encode_sparse_structure_latent(sparse_structure_voxel, sample_posterior=False)
+                sparse_structure_latent = self.load_sparse_structure_latent(sparse_structure_latent_path)
             ss_init_noise = self.invert_sparse_structure_latent(
                 cond_512,
                 sparse_structure_latent,
