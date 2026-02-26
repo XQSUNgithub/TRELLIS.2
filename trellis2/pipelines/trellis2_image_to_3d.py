@@ -30,6 +30,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     """
     model_names_to_load = [
         'sparse_structure_flow_model',
+        'sparse_structure_encoder',
         'sparse_structure_decoder',
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
@@ -191,6 +192,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
+        init_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
@@ -205,7 +207,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
-        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        if init_noise is None:
+            noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        else:
+            noise = init_noise.to(self.device)
+            assert noise.shape[1:] == (in_channels, reso, reso, reso), f"Invalid init_noise shape: {noise.shape}"
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
@@ -233,6 +239,55 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
         return coords
+
+    @torch.no_grad()
+    def encode_sparse_structure_latent(
+        self,
+        sparse_voxel: torch.Tensor,
+        sample_posterior: bool = False,
+    ) -> torch.Tensor:
+        """
+        Encode sparse structure occupancy into sparse structure latent (x_0).
+
+        Args:
+            sparse_voxel (torch.Tensor): Occupancy tensor with shape [N, 1, R, R, R].
+            sample_posterior (bool): Whether to sample posterior in VAE encoder.
+        """
+        assert 'sparse_structure_encoder' in self.models, "No sparse_structure_encoder found in pipeline models."
+        encoder = self.models['sparse_structure_encoder']
+        if self.low_vram:
+            encoder.to(self.device)
+        x_0 = encoder(sparse_voxel.to(self.device), sample_posterior=sample_posterior)
+        if self.low_vram:
+            encoder.cpu()
+        return x_0
+
+    @torch.no_grad()
+    def invert_sparse_structure_latent(
+        self,
+        cond: dict,
+        sparse_structure_latent: torch.Tensor,
+        sampler_params: dict = {},
+    ) -> torch.Tensor:
+        """
+        Invert sparse structure latent x_0 to noise by integrating from t=0 to t=1.
+        """
+        flow_model = self.models['sparse_structure_flow_model']
+        inv_sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        inv_sampler_params.setdefault('guidance_strength', 1.0)
+        if self.low_vram:
+            flow_model.to(self.device)
+        eps_hat = self.sparse_structure_sampler.inverse_sample(
+            flow_model,
+            sparse_structure_latent.to(self.device),
+            **cond,
+            **inv_sampler_params,
+            verbose=True,
+            tqdm_desc="Inverting sparse structure",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+        return eps_hat
 
     def sample_shape_slat(
         self,
@@ -498,6 +553,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        sparse_structure_latent: Optional[torch.Tensor] = None,
+        sparse_structure_voxel: Optional[torch.Tensor] = None,
+        use_sparse_structure_inversion: bool = False,
+        sparse_structure_inversion_sampler_params: dict = {},
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -513,6 +572,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            sparse_structure_latent (torch.Tensor): Optional sparse structure latent x_0 used for inversion.
+            sparse_structure_voxel (torch.Tensor): Optional sparse occupancy [N, 1, R, R, R] to encode into x_0 before inversion.
+            use_sparse_structure_inversion (bool): If True, invert x_0 to noise and then sample sparse structure from this noise.
+            sparse_structure_inversion_sampler_params (dict): Additional sampler params for inversion.
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -539,9 +602,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         cond_512 = self.get_cond([image], 512)
         cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+
+        ss_init_noise = None
+        if use_sparse_structure_inversion:
+            assert (sparse_structure_latent is not None) ^ (sparse_structure_voxel is not None), \
+                "Provide exactly one of sparse_structure_latent or sparse_structure_voxel when use_sparse_structure_inversion=True"
+            if sparse_structure_latent is None:
+                sparse_structure_latent = self.encode_sparse_structure_latent(sparse_structure_voxel, sample_posterior=False)
+            ss_init_noise = self.invert_sparse_structure_latent(
+                cond_512,
+                sparse_structure_latent,
+                sparse_structure_inversion_sampler_params,
+            )
+
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
-            num_samples, sparse_structure_sampler_params
+            num_samples, sparse_structure_sampler_params,
+            init_noise=ss_init_noise,
         )
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(

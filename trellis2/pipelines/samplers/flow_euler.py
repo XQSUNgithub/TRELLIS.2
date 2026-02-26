@@ -125,6 +125,51 @@ class FlowEulerSampler(Sampler):
         ret.samples = sample
         return ret
 
+    @torch.no_grad()
+    def inverse_sample(
+        self,
+        model,
+        x_0,
+        cond: Optional[Any] = None,
+        steps: int = 50,
+        rescale_t: float = 1.0,
+        verbose: bool = True,
+        tqdm_desc: str = "Inverting",
+        **kwargs
+    ):
+        """
+        Invert a latent from t=0 to t=1 with Euler method.
+
+        Args:
+            model: The flow model.
+            x_0: The latent at t=0.
+            cond: conditional information.
+            steps: The number of inversion steps.
+            rescale_t: The rescale factor for t.
+            verbose: If True, show a progress bar.
+            tqdm_desc: A customized tqdm desc.
+            **kwargs: Additional arguments for model inference.
+
+        Returns:
+            a dict containing the following
+            - 'samples': the inverted latent at t=1 (noise).
+            - 'pred_x_t': a list of intermediate latent states.
+            - 'pred_x_0': a list of prediction of x_0.
+        """
+        sample = x_0
+        t_seq = np.linspace(0, 1, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t_seq = t_seq.tolist()
+        t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
+        ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
+        for t, t_next in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+            pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, sample, t, cond, **kwargs)
+            sample = sample + (t_next - t) * pred_v
+            ret.pred_x_t.append(sample)
+            ret.pred_x_0.append(pred_x_0)
+        ret.samples = sample
+        return ret
+
 
 class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
     """
