@@ -51,6 +51,47 @@ class FlowEulerSampler(Sampler):
         return pred_x_0, pred_eps, pred_v
 
     @torch.no_grad()
+    def denoise(
+        self,
+        model,
+        x_t,
+        t: float,
+        t_next: float,
+        cond: Optional[Any] = None,
+        mode: Literal["sample", "inverse"] = "sample",
+        use_rf_solver: bool = True,
+        **kwargs
+    ):
+        """
+        Integrate one step on rectified-flow ODE from t to t_next.
+
+        Args:
+            mode: ``"sample"`` for denoising path (1 -> 0), ``"inverse"`` for
+                inversion path (0 -> 1).
+
+        Note:
+            Sampling and inversion share the same ODE update, but we explicitly
+            validate direction by mode to avoid ambiguous callsites.
+        """
+        if mode not in ("sample", "inverse"):
+            raise ValueError(f"Invalid denoise mode: {mode}")
+
+        dt = t_next - t
+        if mode == "sample" and dt > 0:
+            raise ValueError(f"sample mode expects non-increasing t, got t={t}, t_next={t_next}")
+        if mode == "inverse" and dt < 0:
+            raise ValueError(f"inverse mode expects non-decreasing t, got t={t}, t_next={t_next}")
+        pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
+        pred_x_next = x_t + dt * pred_v
+        if not use_rf_solver or dt == 0:
+            return edict({"pred_x_next": pred_x_next, "pred_x_0": pred_x_0})
+
+        _, _, pred_v_next = self._get_model_prediction(model, pred_x_next, t_next, cond, **kwargs)
+        pred_x_next = x_t + dt * 0.5 * (pred_v + pred_v_next)
+
+        return edict({"pred_x_next": pred_x_next, "pred_x_0": pred_x_0})
+
+    @torch.no_grad()
     def sample_once(
         self,
         model,
@@ -58,6 +99,7 @@ class FlowEulerSampler(Sampler):
         t: float,
         t_prev: float,
         cond: Optional[Any] = None,
+        use_rf_solver: bool = True,
         **kwargs
     ):
         """
@@ -76,9 +118,8 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_prev': x_{t-1}.
             - 'pred_x_0': a prediction of x_0.
         """
-        pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
-        pred_x_prev = x_t - (t - t_prev) * pred_v
-        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+        out = self.denoise(model, x_t, t, t_prev, cond, mode="sample", use_rf_solver=use_rf_solver, **kwargs)
+        return edict({"pred_x_prev": out.pred_x_next, "pred_x_0": out.pred_x_0})
 
     @torch.no_grad()
     def sample(
@@ -90,6 +131,7 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        use_rf_solver: bool = True,
         **kwargs
     ):
         """
@@ -118,7 +160,7 @@ class FlowEulerSampler(Sampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+            out = self.sample_once(model, sample, t, t_prev, cond, use_rf_solver=use_rf_solver, **kwargs)
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
@@ -135,6 +177,7 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Inverting",
+        use_rf_solver: bool = True,
         **kwargs
     ):
         """
@@ -163,10 +206,19 @@ class FlowEulerSampler(Sampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         for t, t_next in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
-            pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, sample, t, cond, **kwargs)
-            sample = sample + (t_next - t) * pred_v
+            out = self.denoise(
+                model,
+                sample,
+                t,
+                t_next,
+                cond,
+                mode="inverse",
+                use_rf_solver=use_rf_solver,
+                **kwargs,
+            )
+            sample = out.pred_x_next
             ret.pred_x_t.append(sample)
-            ret.pred_x_0.append(pred_x_0)
+            ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample
         return ret
 
