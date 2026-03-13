@@ -22,7 +22,8 @@ pipeline.cuda()
 
 # 3. Load Image & Run
 image = Image.open("assets/example_image/T.png")
-mesh = pipeline.run(image)[0]
+# mesh = pipeline.run(image)[0]
+mesh = pipeline.run(image=image,sparse_structure_latent_path="/content/TRELLIS.2/datasets/ObjaverseXL_sketchfab/ss_latents/ss_enc_conv3d_16l8_fp16_64/000045aad61c956b45fc468b2b2ec954636e5f647f1c1995854d46ecaa525e10.npz",use_sparse_structure_inversion=True)[0]
 mesh.simplify(16777216) # nvdiffrast limit
 
 # 4. Render Video

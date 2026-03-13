@@ -1,5 +1,6 @@
 import os
 import sys
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import json
 import argparse
@@ -17,12 +18,15 @@ import trellis2.modules.sparse as sp
 
 torch.set_grad_enabled(False)
 
+
 def is_valid_sparse_tensor(tensor):
     return torch.isfinite(tensor.feats).all() and torch.isfinite(tensor.coords).all()
+
 
 def clear_cuda_error():
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -36,7 +40,8 @@ if __name__ == '__main__':
                         help='Filter objects with aesthetic score lower than this value')
     parser.add_argument('--resolution', type=int, default=1024,
                         help='Sparse voxel resolution')
-    parser.add_argument('--enc_pretrained', type=str, default='microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16',
+    parser.add_argument('--enc_pretrained', type=str,
+                        default='microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16',
                         help='Pretrained encoder model')
     parser.add_argument('--model_root', type=str,
                         help='Root directory of models')
@@ -64,23 +69,45 @@ if __name__ == '__main__':
         encoder.load_state_dict(torch.load(ckpt_path), strict=False)
         encoder.eval()
         print(f'Loaded model from {ckpt_path}')
-    
+
     os.makedirs(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, 'new_records'), exist_ok=True)
-    
+
     # get file list
     if not os.path.exists(os.path.join(opt.root, 'metadata.csv')):
         raise ValueError('metadata.csv not found')
     metadata = pd.read_csv(os.path.join(opt.root, 'metadata.csv')).set_index('sha256')
     if os.path.exists(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.root, 'aesthetic_scores','metadata.csv')).set_index('sha256'))
+        metadata = metadata.combine_first(
+            pd.read_csv(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')).set_index('sha256'))
     if os.path.exists(os.path.join(opt.dual_grid_root, f'dual_grid_{opt.resolution}', 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.dual_grid_root, f'dual_grid_{opt.resolution}','metadata.csv')).set_index('sha256'))
+        metadata = metadata.combine_first(
+            pd.read_csv(os.path.join(opt.dual_grid_root, f'dual_grid_{opt.resolution}', 'metadata.csv')).set_index(
+                'sha256'))
     if os.path.exists(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name,'metadata.csv')).set_index('sha256'))
+        metadata = metadata.combine_first(
+            pd.read_csv(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, 'metadata.csv')).set_index(
+                'sha256'))
     metadata = metadata.reset_index()
+    if 'dual_grid_converted' not in metadata.columns:
+        metadata['dual_grid_converted'] = False
+
+        dual_grid_path = os.path.join(opt.dual_grid_root, f'dual_grid_{opt.resolution}')
+
+        if os.path.exists(dual_grid_path):
+            converted_files = [
+                f.replace('.vxz', '')
+                for f in os.listdir(dual_grid_path)
+                if f.endswith('.vxz')
+            ]
+
+        metadata.loc[
+            metadata['sha256'].isin(converted_files),
+            'dual_grid_converted'
+        ] = True
     if opt.instances is None:
         if opt.filter_low_aesthetic_score is not None:
             metadata = metadata[metadata['aesthetic_score'] >= opt.filter_low_aesthetic_score]
+        print(metadata.columns)
         metadata = metadata[metadata['dual_grid_converted'] == True]
         if 'shape_latent_encoded' in metadata.columns:
             metadata = metadata[metadata['shape_latent_encoded'] != True]
@@ -96,27 +123,30 @@ if __name__ == '__main__':
     end = len(metadata) * (opt.rank + 1) // opt.world_size
     metadata = metadata[start:end]
     records = []
-    
+
     # filter out objects that are already processed
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor, \
-        tqdm(total=len(metadata), desc="Filtering existing objects") as pbar:
+            tqdm(total=len(metadata), desc="Filtering existing objects") as pbar:
         def check_sha256(sha256):
             if os.path.exists(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, f'{sha256}.npz')):
-                coords = np.load(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, f'{sha256}.npz'))['coords']
+                coords = np.load(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, f'{sha256}.npz'))[
+                    'coords']
                 records.append({'sha256': sha256, 'shape_latent_encoded': True, 'shape_latent_tokens': coords.shape[0]})
             pbar.update()
+
+
         executor.map(check_sha256, metadata['sha256'].values)
         executor.shutdown(wait=True)
     existing_sha256 = set(r['sha256'] for r in records)
     print(f'Found {len(existing_sha256)} processed objects')
     metadata = metadata[~metadata['sha256'].isin(existing_sha256)]
-        
+
     print(f'Processing {len(metadata)} objects...')
-    
+
     sha256s = list(metadata['sha256'].values)
     load_queue = Queue(maxsize=32)
     with ThreadPoolExecutor(max_workers=32) as loader_executor, \
-         ThreadPoolExecutor(max_workers=32) as saver_executor:
+            ThreadPoolExecutor(max_workers=32) as saver_executor:
 
         def loader(sha256):
             try:
@@ -138,20 +168,24 @@ if __name__ == '__main__':
                 print(f"[Loader Error] {sha256}: {e}")
                 load_queue.put((sha256, None, None))
 
+
         loader_executor.map(loader, sha256s)
-        
+
+
         def saver(sha256, pack):
             save_path = os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, f'{sha256}.npz')
             np.savez_compressed(save_path, **pack)
-            records.append({'sha256': sha256, 'shape_latent_encoded': True, 'shape_latent_tokens': pack['coords'].shape[0]})
-            
+            records.append(
+                {'sha256': sha256, 'shape_latent_encoded': True, 'shape_latent_tokens': pack['coords'].shape[0]})
+
+
         for _ in tqdm(range(len(sha256s)), desc="Extracting latents"):
             try:
                 sha256, vertices, intersected = load_queue.get()
                 if vertices is None or intersected is None:
                     print(f"[Skip] {sha256}: Failed to load input")
                     continue
-                
+
                 num_voxels = vertices.feats.shape[0]
 
                 # NaN/Inf
@@ -177,8 +211,10 @@ if __name__ == '__main__':
                 print(f"[Error] {sha256} ({num_voxels} voxels): {e}")
                 clear_cuda_error()
                 continue
-            
+
         saver_executor.shutdown(wait=True)
-        
+
     records = pd.DataFrame.from_records(records)
-    records.to_csv(os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, 'new_records', f'part_{opt.rank}.csv'), index=False)
+    records.to_csv(
+        os.path.join(opt.shape_latent_root, 'shape_latents', latent_name, 'new_records', f'part_{opt.rank}.csv'),
+        index=False)

@@ -12,6 +12,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, required=True,
                         help='Directory to save the metadata')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory to save the metadata')
     parser.add_argument('--download_root', type=str, default=None,
                         help='Directory to download the objects')
     parser.add_argument('--filter_low_aesthetic_score', type=float, default=None,
@@ -25,6 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--world_size', type=int, default=1)
     opt = parser.parse_args(sys.argv[2:])
     opt = edict(vars(opt))
+    opt.output_dir = opt.output_dir or opt.root
     opt.download_root = opt.download_root or opt.root
 
     os.makedirs(opt.root, exist_ok=True)
@@ -36,9 +39,11 @@ if __name__ == '__main__':
         raise ValueError('metadata.csv not found')
     metadata = pd.read_csv(os.path.join(opt.root, 'metadata.csv')).set_index('sha256')
     if os.path.exists(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.root, 'aesthetic_scores','metadata.csv')).set_index('sha256'))
+        metadata = metadata.combine_first(
+            pd.read_csv(os.path.join(opt.root, 'aesthetic_scores', 'metadata.csv')).set_index('sha256'))
     if os.path.exists(os.path.join(opt.download_root, 'raw', 'metadata.csv')):
-        metadata = metadata.combine_first(pd.read_csv(os.path.join(opt.download_root, 'raw', 'metadata.csv')).set_index('sha256'))
+        metadata = metadata.combine_first(
+            pd.read_csv(os.path.join(opt.download_root, 'raw', 'metadata.csv')).set_index('sha256'))
     metadata = metadata.reset_index()
     if opt.instances is None:
         if opt.filter_low_aesthetic_score is not None:
@@ -56,7 +61,7 @@ if __name__ == '__main__':
     start = len(metadata) * opt.rank // opt.world_size
     end = len(metadata) * (opt.rank + 1) // opt.world_size
     metadata = metadata[start:end]
-                
+
     print(f'Processing {len(metadata)} objects...')
 
     # process objects
