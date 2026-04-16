@@ -5,7 +5,7 @@ import cv2
 import imageio
 from PIL import Image
 import torch
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
+from trellis2.pipelines import Trellis2ImageTo3DEditPipeline
 from trellis2.utils import render_utils
 from trellis2.renderers import EnvMap
 import o_voxel
@@ -17,7 +17,7 @@ envmap = EnvMap(torch.tensor(
 ))
 
 # 2. Load Pipeline
-pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+pipeline = Trellis2ImageTo3DEditPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
 pipeline.cuda()
 
 # 3. Load Image & Run

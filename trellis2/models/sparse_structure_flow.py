@@ -245,3 +245,88 @@ class SparseStructureFlowModel(nn.Module):
         h = h.permute(0, 2, 1).view(h.shape[0], h.shape[2], *[self.resolution] * 3).contiguous()
 
         return h
+
+class SparseStructureFlowModelWithFeatures(SparseStructureFlowModel):
+    """
+    SparseStructureFlowModel variant that also returns intermediate block features.
+
+    The returned feature dictionary stores:
+      - block-XX-norm-01: output right after block.norm1
+      - block-XX-norm-02: output right after block.norm2
+      - block-XX-final: final output of each block
+    """
+
+    def _forward_block_with_features(
+        self,
+        block: ModulatedTransformerCrossBlock,
+        block_idx: int,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.share_mod:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                block.modulation + t_emb
+            ).type(t_emb.dtype).chunk(6, dim=1)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaLN_modulation(t_emb).chunk(6, dim=1)
+
+        block_features: Dict[str, torch.Tensor] = {}
+        block_prefix = f"block-{block_idx + 1:02d}"
+
+        h = block.norm1(x)
+        block_features[f"{block_prefix}-norm-01"] = h
+
+        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = block.self_attn(h, phases=self.rope_phases)
+        h = h * gate_msa.unsqueeze(1)
+        x = x + h
+
+        h = block.norm2(x)
+        block_features[f"{block_prefix}-norm-02"] = h
+
+        h = block.cross_attn(h, cond)
+        x = x + h
+        h = block.norm3(x)
+        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        h = block.mlp(h)
+        h = h * gate_mlp.unsqueeze(1)
+        x = x + h
+
+        block_features[f"{block_prefix}-final"] = x
+        return x, block_features
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
+                f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
+
+        h = x.view(*x.shape[:2], -1).permute(0, 2, 1).contiguous() # 已在latent空间 无需embedding
+        h = self.input_layer(h)
+
+        if self.pe_mode == "ape":
+            h = h + self.pos_emb[None]
+
+        t_emb = self.t_embedder(t)
+        if self.share_mod:
+            t_emb = self.adaLN_modulation(t_emb)
+
+        t_emb = manual_cast(t_emb, self.dtype)
+        h = manual_cast(h, self.dtype)
+        cond = manual_cast(cond, self.dtype)
+
+        all_features: Dict[str, torch.Tensor] = {}
+        for block_idx, block in enumerate(self.blocks):
+            h, block_features = self._forward_block_with_features(block, block_idx, h, t_emb, cond)
+            all_features.update(block_features)
+
+        h = manual_cast(h, x.dtype)
+        h = F.layer_norm(h, h.shape[-1:])
+        h = self.out_layer(h)
+        h = h.permute(0, 2, 1).view(h.shape[0], h.shape[2], *[self.resolution] * 3).contiguous()
+
+        return h, all_features

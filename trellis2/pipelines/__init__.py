@@ -48,5 +48,5 @@ def from_pretrained(path: str):
 # For PyLance
 if __name__ == '__main__':
     from . import samplers, rembg
-    from .trellis2_image_to_3d import Trellis2ImageTo3DPipeline
+    from .trellis2_image_to_3d import Trellis2ImageTo3DEditPipeline
     from .trellis2_texturing import Trellis2TexturingPipeline

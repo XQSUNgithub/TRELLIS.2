@@ -13,7 +13,7 @@ from PIL import Image
 import base64
 import io
 from trellis2.modules.sparse import SparseTensor
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
+from trellis2.pipelines import Trellis2ImageTo3DEditPipeline
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
@@ -624,7 +624,7 @@ if __name__ == "__main__":
         icon = Image.open(MODES[i]['icon'])
         MODES[i]['icon_base64'] = image_to_base64(icon)
 
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained('microsoft/TRELLIS.2-4B')
+    pipeline = Trellis2ImageTo3DEditPipeline.from_pretrained('microsoft/TRELLIS.2-4B')
     pipeline.cuda()
     
     envmap = {
