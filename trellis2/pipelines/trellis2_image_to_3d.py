@@ -249,6 +249,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             cond: dict,
             resolution: int,
             num_samples: int = 1,
+            latent_noise_ref: list =[],
             sampler_params: dict = {},
             init_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -298,6 +299,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         sampler_params["mask_tar"] = mask_tar
         sampler_params["mask_other"] = mask_other
 
+        sampler_params["latent_noise_ref"] = latent_noise_ref
         noise[:, :, h_1_8:h_1_4] = noise[:, :, :h_1_8].clone()
 
         if self.low_vram:
@@ -762,11 +764,14 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
                 sparse_structure_inversion_sampler_params,
             )
             ss_init_noise=rets.samples
-            sparse_structure_sampler_params["latent_noise_ref"] = rets.pred_x_t
+            #sparse_structure_sampler_params["latent_noise_ref"] = rets.pred_x_t
+            latent_noise_ref = rets.pred_x_t
+            if not rets.pred_x_t:
+              raise ValueError(f"Invalid pred_x_t: {rets}")
 
         coords = self.edit_sparse_structure(
             cond_512, ss_res,
-            num_samples, sparse_structure_sampler_params,
+            num_samples, latent_noise_ref, sparse_structure_sampler_params,
             init_noise=ss_init_noise,
         )
         # coords可视化

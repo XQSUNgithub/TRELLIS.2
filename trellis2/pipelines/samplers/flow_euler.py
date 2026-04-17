@@ -17,9 +17,10 @@ class FlowEulerSampler(Sampler):
     Args:
         sigma_min: The minimum scale of noise in flow.
     """
+
     def __init__(
-        self,
-        sigma_min: float,
+            self,
+            sigma_min: float,
     ):
         self.sigma_min = sigma_min
 
@@ -36,7 +37,7 @@ class FlowEulerSampler(Sampler):
         eps = (1 - t) * v + x_t
         x_0 = (1 - self.sigma_min) * x_t - (self.sigma_min + (1 - self.sigma_min) * t) * v
         return x_0, eps
-    
+
     def _pred_to_xstart(self, x_t, t, pred):
         return (1 - self.sigma_min) * x_t - (self.sigma_min + (1 - self.sigma_min) * t) * pred
 
@@ -55,7 +56,8 @@ class FlowEulerSampler(Sampler):
     def _ensure_feature_estimator(self, model) -> None:
         self.estimator = model
 
-    def _forward_with_features(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def _forward_with_features(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> Tuple[
+        torch.Tensor, Dict[str, torch.Tensor]]:
         # out = self.estimator(x, t, cond)
         # if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
         #     return out
@@ -65,6 +67,12 @@ class FlowEulerSampler(Sampler):
         #         "Feature guidance expects a model that either returns `(pred, feature_dict)` "
         #         "or exposes `.blocks` with transformer blocks for hook-based feature capture."
         #     )
+        if not torch.is_tensor(t):
+            t = torch.tensor([1000 * t] * x.shape[0], device=x.device, dtype=torch.float32)
+        elif t.ndim == 0:
+            t = t.to(device=x.device, dtype=torch.float32).repeat(x.shape[0]) * 1000
+        else:
+            t = t.to(device=x.device, dtype=torch.float32)
 
         features: Dict[str, torch.Tensor] = {}
         hooks = []
@@ -88,24 +96,23 @@ class FlowEulerSampler(Sampler):
                 hook.remove()
         return pred, features
 
-
     # guidance
     # 用SparseStructureFlowModelWithFeatures算用于guidance的相似度
     def compute_guidance(
-        self,
-        mask_x0,
-        mask_cur,
-        mask_tar,
-        mask_other,
-        latent,
-        latent_noise_ref,
-        t,
-        cond,
-        up_ft_index=["block-17-norm-01", "block-17-norm-02"],
-        energy_scale = 2,
-        w_edit = 4,
-        w_inpaint = 0.2,
-        w_content = 6
+            self,
+            mask_x0,
+            mask_cur,
+            mask_tar,
+            mask_other,
+            latent,
+            latent_noise_ref,
+            t,
+            cond,
+            up_ft_index=["block-17-norm-01", "block-17-norm-02"],
+            energy_scale=2,
+            w_edit=4,
+            w_inpaint=0.2,
+            w_content=6
     ):
         """
 
@@ -133,9 +140,11 @@ class FlowEulerSampler(Sampler):
         cos = nn.CosineSimilarity(dim=1)
 
         def _to_volume(feature_tokens: torch.Tensor, resolution: int) -> torch.Tensor:
-            return feature_tokens.permute(0, 2, 1).reshape(feature_tokens.shape[0], feature_tokens.shape[2], resolution, resolution, resolution)
+            return feature_tokens.permute(0, 2, 1).reshape(feature_tokens.shape[0], feature_tokens.shape[2], resolution,
+                                                           resolution, resolution)
 
-        def _resize_mask(mask: torch.Tensor, spatial_size: Tuple[int, int, int], ref_dtype: torch.dtype) -> torch.Tensor:
+        def _resize_mask(mask: torch.Tensor, spatial_size: Tuple[int, int, int],
+                         ref_dtype: torch.dtype) -> torch.Tensor:
             if mask.dim() == 3:
                 mask = mask[None, None]
             return (F.interpolate(mask.float(), size=spatial_size, mode="nearest") > 0).to(dtype=ref_dtype)
@@ -145,9 +154,10 @@ class FlowEulerSampler(Sampler):
 
         latent = latent.detach().requires_grad_(True)
         _, up_ft_cur_dict = self._forward_with_features(latent, t, cond)
+        # print("up_ft_cur_dict:", up_ft_cur_dict.grad_fn)
 
         # 17 18层 或者
-        feature_keys =sorted(k for k in up_ft_tar_dict.keys() if k in up_ft_index)
+        feature_keys = sorted(k for k in up_ft_tar_dict.keys() if k in up_ft_index)
         if len(feature_keys) == 0:
             raise ValueError("SparseStructureFlowModelWithFeatures did not return any features.")
 
@@ -162,8 +172,12 @@ class FlowEulerSampler(Sampler):
         up_ft_tar = []
         up_ft_cur = []
         for key in feature_keys:
+            print("up_ft_cur_dict[key]:", up_ft_cur_dict[key].requires_grad)
+            print("up_ft_tar_dict[key]:", up_ft_tar_dict[key].requires_grad)
             tar_ft = _to_volume(up_ft_tar_dict[key], resolution)
             cur_ft = _to_volume(up_ft_cur_dict[key], resolution)
+            print("cur_ft:", cur_ft.requires_grad)
+            print("tar_ft:", tar_ft.requires_grad)
             # if up_scale != 1:
             #     tar_ft = F.interpolate(tar_ft, size=target_size, mode="trilinear", align_corners=False)
             #     cur_ft = F.interpolate(cur_ft, size=target_size, mode="trilinear", align_corners=False)
@@ -171,30 +185,43 @@ class FlowEulerSampler(Sampler):
             up_ft_cur.append(cur_ft)
 
         # 使用和latent相同的device和dtype
-        loss_edit = latent.new_tensor(0.0)
+        loss_edit = 0
         for f_id in range(len(up_ft_tar)):
             for mask_cur_i, mask_tar_i in zip(mask_cur, mask_tar):
                 # cur_mask = _resize_mask(mask_cur_i, up_ft_cur[f_id].shape[-3:], up_ft_cur[f_id].dtype).bool()
                 # tar_mask = _resize_mask(mask_tar_i, up_ft_tar[f_id].shape[-3:], up_ft_tar[f_id].dtype).bool()
 
-                up_ft_cur_vec = up_ft_cur[f_id][mask_cur_i.repeat(1, up_ft_cur[f_id].shape[1], 1, 1, 1)].view(up_ft_cur[f_id].shape[1], -1).permute(1, 0)
-                up_ft_tar_vec = up_ft_tar[f_id][mask_tar_i.repeat(1, up_ft_tar[f_id].shape[1], 1, 1, 1)].view(up_ft_tar[f_id].shape[1], -1).permute(1, 0)
+                cur_mask = mask_cur_i > 0.5
+                tar_mask = mask_tar_i > 0.5
+
+                up_ft_cur_vec = up_ft_cur[f_id][cur_mask.repeat(1, up_ft_cur[f_id].shape[1], 1, 1, 1)].view(
+                    up_ft_cur[f_id].shape[1], -1).permute(1, 0)
+                up_ft_tar_vec = up_ft_tar[f_id][tar_mask.repeat(1, up_ft_tar[f_id].shape[1], 1, 1, 1)].view(
+                    up_ft_tar[f_id].shape[1], -1).permute(1, 0)
                 num_pts = min(up_ft_cur_vec.shape[0], up_ft_tar_vec.shape[0])
                 if num_pts > 0:
                     sim = (cos(up_ft_cur_vec[:num_pts], up_ft_tar_vec[:num_pts]) + 1.0) / 2.0
                     loss_edit = loss_edit + w_edit / (1 + 4 * sim.mean())
+                    print("have feature：", sim)
+                else:
+                    raise ValueError(f"Invalid up_ft_cur_vec: {up_ft_cur_vec}")
 
-                mask_overlap = ((mask_cur_i.float() + mask_tar_i.float()) > 1.5).float()
-                mask_non_overlap = (mask_tar_i.float() - mask_overlap) > 0.5
+                mask_overlap = ((cur_mask.float() + tar_mask.float()) > 1.5).float()
+                mask_non_overlap = (tar_mask.float() - mask_overlap) > 0.5
 
-                up_ft_cur_non_overlap = up_ft_cur[f_id][mask_non_overlap.repeat(1, up_ft_cur[f_id].shape[1], 1, 1, 1)].view(up_ft_cur[f_id].shape[1], -1).permute(1, 0)
-                up_ft_tar_non_overlap = up_ft_tar[f_id][mask_non_overlap.repeat(1, up_ft_tar[f_id].shape[1], 1, 1, 1)].view(up_ft_tar[f_id].shape[1], -1).permute(1, 0)
+                up_ft_cur_non_overlap = up_ft_cur[f_id][
+                    mask_non_overlap.repeat(1, up_ft_cur[f_id].shape[1], 1, 1, 1)].view(up_ft_cur[f_id].shape[1],
+                                                                                        -1).permute(1, 0)
+                up_ft_tar_non_overlap = up_ft_tar[f_id][
+                    mask_non_overlap.repeat(1, up_ft_tar[f_id].shape[1], 1, 1, 1)].view(up_ft_tar[f_id].shape[1],
+                                                                                        -1).permute(1, 0)
                 num_non_overlap = min(up_ft_cur_non_overlap.shape[0], up_ft_tar_non_overlap.shape[0])
                 if num_non_overlap > 0:
-                    sim_non_overlap = (cos(up_ft_cur_non_overlap[:num_non_overlap], up_ft_tar_non_overlap[:num_non_overlap]) + 1.0) / 2.0
+                    sim_non_overlap = (cos(up_ft_cur_non_overlap[:num_non_overlap],
+                                           up_ft_tar_non_overlap[:num_non_overlap]) + 1.0) / 2.0
                     loss_edit = loss_edit + w_inpaint * sim_non_overlap.mean()
 
-        loss_con = latent.new_tensor(0.0)
+        loss_con = 0
         other_mask = _resize_mask(mask_other, up_ft_tar[0].shape[-3:], up_ft_tar[0].dtype).bool()
         for f_id in range(len(up_ft_tar)):
             sim_other = (cos(up_ft_tar[f_id], up_ft_cur[f_id])[0][other_mask[0, 0]] + 1.0) / 2.0
@@ -204,6 +231,16 @@ class FlowEulerSampler(Sampler):
         loss_edit = loss_edit / len(up_ft_cur) / max(len(mask_cur), 1)
         loss_con = loss_con / len(up_ft_cur)
 
+        print("latent.requires_grad:", latent.requires_grad)
+
+        print("latent.is_leaf:", latent.is_leaf)
+
+        print("loss_edit.requires_grad:", loss_edit.requires_grad)
+
+        print("loss_edit.grad_fn:", loss_edit.grad_fn)
+        print("loss_edit:", loss_edit)
+
+        print("energy_scale type:", type(energy_scale))
         cond_grad_edit = torch.autograd.grad(loss_edit * energy_scale, latent, retain_graph=True)[0]
         cond_grad_con = torch.autograd.grad(loss_con * energy_scale, latent)[0]
 
@@ -211,7 +248,7 @@ class FlowEulerSampler(Sampler):
         mask = _resize_mask(mask_x0, cond_grad_edit.shape[-3:], latent.dtype)
         guidance = cond_grad_edit.detach() * 4e-2 * mask + cond_grad_con.detach() * 4e-2 * (1 - mask)
         self.estimator.zero_grad()
-        #guidance维度 b c r r r
+        # guidance维度 b c r r r
         # 预测的v是b c r r r
         return guidance
 
@@ -243,15 +280,20 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_prev': x_{t-1}.
             - 'pred_x_0': a prediction of x_0.
         """
-        with torch.no_grad():
-         pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
-        latent = x_t
-        latent_noise_ref = kwargs.get("latent_noise_ref")[-(i+1)]
 
-        mask_x0 = kwargs.get("mask_x0") # 编辑区域 d w h 16
-        mask_cur = kwargs.get("mask_cur") # target region
-        mask_tar = kwargs.get("mask_tar") # source region
-        mask_other = kwargs.get("mask_other") # bchw 更小的编辑区域 和latent一致 b c 16 16 16
+        latent = x_t
+        latent_noise_ref = kwargs.get("latent_noise_ref")[-(i + 1)]
+
+        mask_x0 = kwargs.get("mask_x0")  # 编辑区域 d w h 16
+        mask_cur = kwargs.get("mask_cur")  # target region
+        mask_tar = kwargs.get("mask_tar")  # source region
+        mask_other = kwargs.get("mask_other")  # bchw 更小的编辑区域 和latent一致 b c 16 16 16
+
+        for key in ["latent_noise_ref", "mask_x0", "mask_cur", "mask_tar", "mask_other"]:
+            kwargs.pop(key, None)
+
+        with torch.no_grad():
+            pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
 
         guidance = self.compute_guidance(
             mask_x0,
@@ -268,17 +310,17 @@ class FlowEulerSampler(Sampler):
 
     @torch.no_grad()
     def sample_once(
-        self,
-        model,
-        x_t,
-        t: float,
-        t_prev: float,
-        cond: Optional[Any] = None,
-        **kwargs
+            self,
+            model,
+            x_t,
+            t: float,
+            t_prev: float,
+            cond: Optional[Any] = None,
+            **kwargs
     ):
         """
         Sample x_{t-1} from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             x_t: The [N x C x ...] tensor of noisy inputs at time t.
@@ -335,32 +377,31 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        i=0
+        i = 0
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
             out = self.edit_once(model, sample, t, t_prev, i, cond, **kwargs)
             sample = out.pred_x_prev
             ret.pred_x_t.append(out.pred_x_prev)
             ret.pred_x_0.append(out.pred_x_0)
-            i=i+1
+            i = i + 1
         ret.samples = sample
         return ret
 
-
     @torch.no_grad()
     def sample(
-        self,
-        model,
-        noise,
-        cond: Optional[Any] = None,
-        steps: int = 50,
-        rescale_t: float = 1.0,
-        verbose: bool = True,
-        tqdm_desc: str = "Sampling",
-        **kwargs
+            self,
+            model,
+            noise,
+            cond: Optional[Any] = None,
+            steps: int = 50,
+            rescale_t: float = 1.0,
+            verbose: bool = True,
+            tqdm_desc: str = "Sampling",
+            **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -393,15 +434,15 @@ class FlowEulerSampler(Sampler):
 
     @torch.no_grad()
     def inverse_sample(
-        self,
-        model,
-        x_0,
-        cond: Optional[Any] = None,
-        steps: int = 50,
-        rescale_t: float = 1.0,
-        verbose: bool = True,
-        tqdm_desc: str = "Inverting",
-        **kwargs
+            self,
+            model,
+            x_0,
+            cond: Optional[Any] = None,
+            steps: int = 50,
+            rescale_t: float = 1.0,
+            verbose: bool = True,
+            tqdm_desc: str = "Inverting",
+            **kwargs
     ):
         """
         Invert a latent from t=0 to t=1 with Euler method.
@@ -441,22 +482,23 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
     """
     Generate samples from a flow-matching model using Euler sampling with classifier-free guidance.
     """
+
     @torch.no_grad()
     def sample(
-        self,
-        model,
-        noise,
-        cond,
-        neg_cond,
-        steps: int = 50,
-        rescale_t: float = 1.0,
-        guidance_strength: float = 3.0,
-        verbose: bool = True,
-        **kwargs
+            self,
+            model,
+            noise,
+            cond,
+            neg_cond,
+            steps: int = 50,
+            rescale_t: float = 1.0,
+            guidance_strength: float = 3.0,
+            verbose: bool = True,
+            **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -474,30 +516,33 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond,
+                              guidance_strength=guidance_strength, **kwargs)
 
 
-class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
+class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin,
+                                       FlowEulerSampler):
     """
     Generate samples from a flow-matching model using Euler sampling with classifier-free guidance and interval.
     """
+
     @torch.no_grad()
     def sample(
-        self,
-        model,
-        noise,
-        cond,
-        neg_cond,
-        steps: int = 50,
-        rescale_t: float = 1.0,
-        guidance_strength: float = 3.0,
-        guidance_interval: Tuple[float, float] = (0.0, 1.0),
-        verbose: bool = True,
-        **kwargs
+            self,
+            model,
+            noise,
+            cond,
+            neg_cond,
+            steps: int = 50,
+            rescale_t: float = 1.0,
+            guidance_strength: float = 3.0,
+            guidance_interval: Tuple[float, float] = (0.0, 1.0),
+            verbose: bool = True,
+            **kwargs
     ):
         """
         Generate samples from the model using Euler method.
-        
+
         Args:
             model: The model to sample from.
             noise: The initial noise tensor.
@@ -516,4 +561,5 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             - 'pred_x_t': a list of prediction of x_t.
             - 'pred_x_0': a list of prediction of x_0.
         """
-        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
+        return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond,
+                              guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
