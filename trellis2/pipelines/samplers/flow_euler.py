@@ -82,6 +82,15 @@ class FlowEulerSampler(Sampler):
             hooks.append(block.norm1.register_forward_hook(
                 lambda _module, _inputs, output, key=f"{block_prefix}-norm-01": features.__setitem__(key, output)
             ))
+
+            # hooks.append(block.norm1.register_forward_hook(
+            #     lambda _module, _inputs, output, key=f"{block_prefix}-norm-01": (
+            #         print(key, "hook grad_enabled =", torch.is_grad_enabled(),
+            #               "requires_grad =", output.requires_grad,
+            #               "grad_fn =", output.grad_fn),
+            #         features.__setitem__(key, output)
+            #     )[-1]
+            # ))
             hooks.append(block.norm2.register_forward_hook(
                 lambda _module, _inputs, output, key=f"{block_prefix}-norm-02": features.__setitem__(key, output)
             ))
@@ -172,12 +181,12 @@ class FlowEulerSampler(Sampler):
         up_ft_tar = []
         up_ft_cur = []
         for key in feature_keys:
-            print("up_ft_cur_dict[key]:", up_ft_cur_dict[key].requires_grad)
-            print("up_ft_tar_dict[key]:", up_ft_tar_dict[key].requires_grad)
+            # print("up_ft_cur_dict[key]:", up_ft_cur_dict[key].requires_grad)
+            # print("up_ft_tar_dict[key]:", up_ft_tar_dict[key].requires_grad)
             tar_ft = _to_volume(up_ft_tar_dict[key], resolution)
             cur_ft = _to_volume(up_ft_cur_dict[key], resolution)
-            print("cur_ft:", cur_ft.requires_grad)
-            print("tar_ft:", tar_ft.requires_grad)
+            # print("cur_ft:", cur_ft.requires_grad)
+            # print("tar_ft:", tar_ft.requires_grad)
             # if up_scale != 1:
             #     tar_ft = F.interpolate(tar_ft, size=target_size, mode="trilinear", align_corners=False)
             #     cur_ft = F.interpolate(cur_ft, size=target_size, mode="trilinear", align_corners=False)
@@ -202,7 +211,7 @@ class FlowEulerSampler(Sampler):
                 if num_pts > 0:
                     sim = (cos(up_ft_cur_vec[:num_pts], up_ft_tar_vec[:num_pts]) + 1.0) / 2.0
                     loss_edit = loss_edit + w_edit / (1 + 4 * sim.mean())
-                    print("have feature：", sim)
+                    # print("sim grad：", sim.requires_grad)
                 else:
                     raise ValueError(f"Invalid up_ft_cur_vec: {up_ft_cur_vec}")
 
@@ -231,16 +240,16 @@ class FlowEulerSampler(Sampler):
         loss_edit = loss_edit / len(up_ft_cur) / max(len(mask_cur), 1)
         loss_con = loss_con / len(up_ft_cur)
 
-        print("latent.requires_grad:", latent.requires_grad)
-
-        print("latent.is_leaf:", latent.is_leaf)
-
-        print("loss_edit.requires_grad:", loss_edit.requires_grad)
-
-        print("loss_edit.grad_fn:", loss_edit.grad_fn)
-        print("loss_edit:", loss_edit)
-
-        print("energy_scale type:", type(energy_scale))
+        # print("latent.requires_grad:", latent.requires_grad)
+        #
+        # print("latent.is_leaf:", latent.is_leaf)
+        #
+        # print("loss_edit.requires_grad:", loss_edit.requires_grad)
+        #
+        # print("loss_edit.grad_fn:", loss_edit.grad_fn)
+        # print("loss_edit:", loss_edit)
+        #
+        # print("energy_scale type:", type(energy_scale))
         cond_grad_edit = torch.autograd.grad(loss_edit * energy_scale, latent, retain_graph=True)[0]
         cond_grad_con = torch.autograd.grad(loss_con * energy_scale, latent)[0]
 
@@ -295,16 +304,18 @@ class FlowEulerSampler(Sampler):
         with torch.no_grad():
             pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
 
-        guidance = self.compute_guidance(
-            mask_x0,
-            mask_cur,
-            mask_tar,
-            mask_other,
-            latent,
-            latent_noise_ref,
-            t,
-            cond
-        )
+        with torch.enable_grad():
+            guidance = self.compute_guidance(
+                mask_x0,
+                mask_cur,
+                mask_tar,
+                mask_other,
+                latent,
+                latent_noise_ref,
+                t,
+                cond
+            )
+
         pred_x_prev = x_t - (t - t_prev) * (pred_v + guidance)
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
