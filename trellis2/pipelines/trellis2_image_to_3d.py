@@ -284,10 +284,21 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         base_tar = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
         base_x0 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
         base_other = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        base_tar[:h_1_8] = 1 # 用在target noise上，实际是cur区域
-        base_cur[h_1_8:h_1_4] = 1
-        base_x0[:h_1_4] = 1
-        base_other[h_1_4:] = 1
+        base_cur[:, :, :h_1_8] = 1 # 用在target noise上，实际是cur区域
+        base_tar[:, :, h_1_8:h_1_4] = 1
+        base_x0[:, :, :h_1_4] = 1
+        base_other[:, :, h_1_4:] = 1
+
+        # base_cur[:, :h_1_8, :] = 1 # 用在target noise上，实际是cur区域
+        # base_tar[:, h_1_8:h_1_4, :] = 1
+        # base_x0[:, :h_1_4, :] = 1
+        # base_other[:, h_1_4:, :] = 1
+
+        # base_cur[:h_1_8] = 1 # 用在target noise上，实际是cur区域
+        # base_tar[h_1_8:h_1_4] = 1
+        # base_x0[:h_1_4] = 1
+        # base_other[h_1_4:] = 1
+
 
         mask_x0 = base_x0
         mask_cur = [base_cur]
@@ -300,7 +311,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         sampler_params["mask_other"] = mask_other
 
         sampler_params["latent_noise_ref"] = latent_noise_ref
-        noise[:, :, h_1_8:h_1_4] = noise[:, :, :h_1_8].clone()
+        noise[:, :, :, :, :h_1_8] = noise[:, :, :, :, h_1_8:h_1_4].clone()
 
         if self.low_vram:
             flow_model.to(self.device)
@@ -326,21 +337,61 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             ratio = decoded.shape[2] // resolution
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5 #变成32
 
+        # coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+        #
+        # coords0 = coords[coords[:, 0] == 0][:, 1:].cpu().numpy()
+        # coords0 = coords0[:, [2, 1, 0]]  # (x,y,z)
+        #
+        # cubes = []
+        #
+        # for p in coords0:
+        #     cube = trimesh.creation.box(extents=(1, 1, 1))
+        #     cube.apply_translation(p)
+        #     cubes.append(cube)
+        #
+        # scene = trimesh.util.concatenate(cubes)
+        #
+        # scene.export("voxels.glb")
+
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
         coords0 = coords[coords[:, 0] == 0][:, 1:].cpu().numpy()
-        coords0 = coords0[:, [2, 1, 0]]  # (x,y,z)
+        coords0 = coords0[:, [2, 0, 1]]
+        coords0 = coords0[:, [1, 2, 0]] # (x, y, z)
 
-        cubes = []
+        # Convert voxel coordinates to point cloud
+        points = coords0.astype(np.float32)
 
-        for p in coords0:
-            cube = trimesh.creation.box(extents=(1, 1, 1))
-            cube.apply_translation(p)
-            cubes.append(cube)
+        # 打印点云坐标系范围
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
 
-        scene = trimesh.util.concatenate(cubes)
+        print("Point cloud coordinate range:")
+        print(f"x: [{mins[0]}, {maxs[0]}]")
+        print(f"y: [{mins[1]}, {maxs[1]}]")
+        print(f"z: [{mins[2]}, {maxs[2]}]")
 
-        scene.export("voxels.glb")
+        # 打印点云最高点坐标
+        highest_idx = np.argmax(points[:, 2])
+        highest_point = points[highest_idx]
+
+        print("Highest point coordinate:")
+        print(f"(x, y, z) = ({highest_point[0]}, {highest_point[1]}, {highest_point[2]})")
+
+        # Map xyz coordinates to RGB values in [0, 255]
+        ranges = np.maximum(maxs - mins, 1e-6)
+
+        rgb = ((points - mins) / ranges * 255).astype(np.uint8)
+
+        # RGBA colors
+        colors = np.concatenate(
+            [rgb, np.full((rgb.shape[0], 1), 255, dtype=np.uint8)],
+            axis=1,
+        )
+
+        point_cloud = trimesh.points.PointCloud(vertices=points, colors=colors)
+
+        point_cloud.export("voxels_pointcloud.glb")
 
         return coords
 

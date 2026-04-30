@@ -1,4 +1,10 @@
 from typing import *
+import csv
+import os
+import matplotlib
+matplotlib.use("Agg")
+import re
+import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -55,6 +61,255 @@ class FlowEulerSampler(Sampler):
 
     def _ensure_feature_estimator(self, model) -> None:
         self.estimator = model
+
+    def _visualize_pca_feature_pointcloud(
+            self,
+            feature: torch.Tensor,
+            n_components: int = 3,
+            max_points: int = 12000
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Convert a 3D feature volume (B, C, R, R, R) to PCA-colored point cloud data.
+        """
+        if not isinstance(feature, torch.Tensor):
+            raise TypeError(f"`feature` must be a torch.Tensor, but got {type(feature)}")
+        if feature.dim() != 5:
+            raise ValueError(f"`feature` must be 5D (B, C, R, R, R), but got shape {tuple(feature.shape)}")
+
+        feature_np = feature.detach().cpu().float().numpy()
+        batch_size, channels, depth, height, width = feature_np.shape
+        if not (depth == height == width):
+            raise ValueError(f"Expected cubic feature volume, but got shape {tuple(feature_np.shape)}")
+
+        n_components = min(max(1, n_components), channels, 3)
+        coords = np.stack(
+            np.meshgrid(
+                np.arange(depth, dtype=np.float32),
+                np.arange(height, dtype=np.float32),
+                np.arange(width, dtype=np.float32),
+                indexing="ij"
+            ),
+            axis=-1
+        ).reshape(-1, 3)
+        coords_norm = coords / max(depth - 1, 1)
+        features_2d = feature_np[0].reshape(channels, -1).T  # (R^3, C), 只可视化 batch 0
+        feature_mean = np.mean(features_2d, axis=0, keepdims=True)
+        feature_std = np.std(features_2d, axis=0, keepdims=True) + 1e-8
+        features_scaled = (features_2d - feature_mean) / feature_std
+
+        _, _, vh = np.linalg.svd(features_scaled, full_matrices=False)
+        components = vh[:n_components].T
+        pca_result = features_scaled @ components
+
+        pca_normalized = np.zeros_like(pca_result, dtype=np.float32)
+        for i in range(pca_result.shape[1]):
+            pca_i = pca_result[:, i]
+            pca_normalized[:, i] = (pca_i - pca_i.min()) / (pca_i.max() - pca_i.min() + 1e-8)
+
+        rgb = np.zeros((pca_normalized.shape[0], 3), dtype=np.float32)
+        rgb[:, :pca_normalized.shape[1]] = pca_normalized[:, :3]
+
+        num_points = coords_norm.shape[0]
+        if num_points > max_points:
+            sample_idx = np.random.choice(num_points, size=max_points, replace=False)
+        else:
+            sample_idx = np.arange(num_points)
+        return coords_norm[sample_idx], rgb[sample_idx]
+
+    def _save_hook_feature_grid(
+            self,
+            features: Dict[str, torch.Tensor],
+            step_tag: float,
+            source_tag: str
+    ) -> None:
+        output_dir = os.path.join("outputs", "pca_feature_pointcloud")
+        os.makedirs(output_dir, exist_ok=True)
+
+        layer_order = ["norm-01", "norm-02", "final"]
+        viewpoint_order = [(20, 35), (20, 125), (85, -90)]  # 3视图
+
+        grouped: Dict[int, Dict[str, torch.Tensor]] = {}
+        for key, value in features.items():
+            match = re.match(r"block-(\d+)-(norm-01|norm-02|final)$", key)
+            if match is None:
+                continue
+            block_idx = int(match.group(1))
+            layer_name = match.group(2)
+            grouped.setdefault(block_idx, {})[layer_name] = value
+
+        if len(grouped) == 0:
+            return
+
+        block_ids = sorted(grouped.keys())
+        n_rows = len(block_ids)
+        n_cols = len(layer_order) * len(viewpoint_order)  # 3 layer x 3 view = 9
+        fig = plt.figure(figsize=(n_cols * 2.1, n_rows * 2.2))
+
+        for row_idx, block_idx in enumerate(block_ids):
+            for layer_idx, layer_name in enumerate(layer_order):
+                feat = grouped[block_idx].get(layer_name, None)
+                coords_plot = None
+                rgb_plot = None
+                if feat is not None and feat.dim() == 3:
+                    resolution = round(feat.shape[1] ** (1 / 3))
+                    if resolution ** 3 == feat.shape[1]:
+                        volume = feat.permute(0, 2, 1).reshape(feat.shape[0], feat.shape[2], resolution, resolution, resolution)
+                        coords_plot, rgb_plot = self._visualize_pca_feature_pointcloud(volume.detach())
+
+                for view_idx, (elev, azim) in enumerate(viewpoint_order):
+                    col_idx = layer_idx * len(viewpoint_order) + view_idx
+                    subplot_idx = row_idx * n_cols + col_idx + 1
+                    ax = fig.add_subplot(n_rows, n_cols, subplot_idx, projection="3d")
+                    if coords_plot is not None and rgb_plot is not None:
+                        ax.scatter(
+                            coords_plot[:, 0], coords_plot[:, 1], coords_plot[:, 2],
+                            c=rgb_plot, s=0.8, alpha=0.8, linewidths=0
+                        )
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.set_zticks([])
+                    ax.set_xlim(0, 1)
+                    ax.set_ylim(0, 1)
+                    ax.set_zlim(0, 1)
+                    ax.view_init(elev=elev, azim=azim)
+                    if row_idx == 0:
+                        ax.set_title(f"{layer_name}\nview-{view_idx + 1}", fontsize=8)
+                    if col_idx == 0:
+                        ax.text2D(0.02, 0.5, f"block-{block_idx:02d}", transform=ax.transAxes, fontsize=8)
+
+        plt.tight_layout()
+        save_path = os.path.join(output_dir, f"step_{step_tag:07.4f}_{source_tag}.png")
+        plt.savefig(save_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        print(f"\t * Saved PCA 3-view grid to {save_path}.")
+
+
+    # def _visualize_pca_feature_pointcloud(
+    #         self,
+    #         feature: torch.Tensor,
+    #         comment: Optional[str] = None,
+    #         n_components: int = 10,
+    #         max_points: int = 50000
+    # ) -> None:
+    #     """
+    #     Visualize a 3D feature volume (B, C, R, R, R) with PCA color mapping and save files.
+    #     """
+    #     if not isinstance(feature, torch.Tensor):
+    #         raise TypeError(f"`feature` must be a torch.Tensor, but got {type(feature)}")
+    #     if feature.dim() != 5:
+    #         raise ValueError(f"`feature` must be 5D (B, C, R, R, R), but got shape {tuple(feature.shape)}")
+    #
+    #     feature_np = feature.detach().cpu().float().numpy()
+    #     batch_size, channels, depth, height, width = feature_np.shape
+    #     if not (depth == height == width):
+    #         raise ValueError(f"Expected cubic feature volume, but got shape {tuple(feature_np.shape)}")
+    #
+    #     output_dir = os.path.join("outputs", "pca_feature_pointcloud")
+    #     os.makedirs(output_dir, exist_ok=True)
+    #     log_path = os.path.join(output_dir, "pca_feature_log.csv")
+    #
+    #     n_components = min(max(1, n_components), channels, 10)
+    #     coords = np.stack(
+    #         np.meshgrid(
+    #             np.arange(depth, dtype=np.float32),
+    #             np.arange(height, dtype=np.float32),
+    #             np.arange(width, dtype=np.float32),
+    #             indexing="ij"
+    #         ),
+    #         axis=-1
+    #     ).reshape(-1, 3)
+    #     coords_norm = coords / max(depth - 1, 1)
+    #
+    #     def _save_pca_log(csv_path: str, explained_variance_ratio: np.ndarray,
+    #                       cumulative_variance: float, row_comment: Optional[str]) -> None:
+    #         ratios = list(explained_variance_ratio.astype(np.float64)) + [0.0] * (10 - len(explained_variance_ratio))
+    #         fieldnames = ["Comment"] + [f"PC{i + 1}" for i in range(10)] + ["Total"]
+    #         file_exists = os.path.exists(csv_path)
+    #         with open(csv_path, "a", newline="") as csvfile:
+    #             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    #             if not file_exists:
+    #                 writer.writeheader()
+    #             row_data = {
+    #                 "Comment": row_comment if row_comment is not None else "",
+    #                 **{f"PC{i + 1}": f"{ratios[i] * 100:.2f}%" for i in range(10)},
+    #                 "Total": f"{cumulative_variance * 100:.2f}%"
+    #             }
+    #             writer.writerow(row_data)
+    #
+    #     for batch_idx in range(batch_size):
+    #         features_2d = feature_np[batch_idx].reshape(channels, -1).T  # (R^3, C)
+    #         feature_mean = np.mean(features_2d, axis=0, keepdims=True)
+    #         feature_std = np.std(features_2d, axis=0, keepdims=True) + 1e-8
+    #         features_scaled = (features_2d - feature_mean) / feature_std
+    #
+    #         # PCA via SVD
+    #         _, singular_values, vh = np.linalg.svd(features_scaled, full_matrices=False)
+    #         components = vh[:n_components].T
+    #         pca_result = features_scaled @ components
+    #         explained_variance = (singular_values ** 2) / max(features_scaled.shape[0] - 1, 1)
+    #         explained_variance_ratio = explained_variance[:n_components] / np.sum(explained_variance + 1e-12)
+    #         cumulative_variance = float(np.sum(explained_variance_ratio))
+    #
+    #         pca_normalized = np.zeros_like(pca_result, dtype=np.float32)
+    #         for i in range(pca_result.shape[1]):
+    #             pca_i = pca_result[:, i]
+    #             pca_normalized[:, i] = (pca_i - pca_i.min()) / (pca_i.max() - pca_i.min() + 1e-8)
+    #
+    #         rgb = np.zeros((pca_normalized.shape[0], 3), dtype=np.float32)
+    #         use_rgb = min(3, pca_normalized.shape[1])
+    #         rgb[:, :use_rgb] = pca_normalized[:, :use_rgb]
+    #
+    #         weights = explained_variance_ratio / (np.sum(explained_variance_ratio) + 1e-12)
+    #         aggregated = np.zeros((pca_normalized.shape[0],), dtype=np.float32)
+    #         for i in range(pca_normalized.shape[1]):
+    #             aggregated += pca_normalized[:, i] * weights[i]
+    #
+    #         num_points = coords_norm.shape[0]
+    #         if num_points > max_points:
+    #             sample_idx = np.random.choice(num_points, size=max_points, replace=False)
+    #         else:
+    #             sample_idx = np.arange(num_points)
+    #
+    #         coords_plot = coords_norm[sample_idx]
+    #         rgb_plot = rgb[sample_idx]
+    #
+    #         safe_comment = (comment or "pca_feature").replace(" ", "_").replace("|", "_").replace("/", "_")
+    #         batch_suffix = f"_b{batch_idx:02d}" if batch_size > 1 else ""
+    #         image_path = os.path.join(output_dir, f"{safe_comment}{batch_suffix}.png")
+    #         npz_path = os.path.join(output_dir, f"{safe_comment}{batch_suffix}.npz")
+    #
+    #         fig = plt.figure(figsize=(8, 8))
+    #         ax = fig.add_subplot(111, projection="3d")
+    #         ax.scatter(
+    #             coords_plot[:, 0], coords_plot[:, 1], coords_plot[:, 2],
+    #             c=rgb_plot,
+    #             s=1.0,
+    #             alpha=0.8,
+    #             linewidths=0
+    #         )
+    #         title_comment = comment if comment is not None else "PCA Feature"
+    #         ax.set_title(f"{title_comment}\nTop {n_components} cumulative={cumulative_variance:.1%}")
+    #         ax.set_xlabel("x")
+    #         ax.set_ylabel("y")
+    #         ax.set_zlabel("z")
+    #         ax.view_init(elev=28, azim=38)
+    #         plt.tight_layout()
+    #         plt.savefig(image_path, dpi=300, bbox_inches="tight")
+    #         plt.close(fig)
+    #
+    #         np.savez_compressed(
+    #             npz_path,
+    #             coords=coords_norm,
+    #             rgb=rgb,
+    #             aggregated=aggregated,
+    #             explained_variance_ratio=explained_variance_ratio
+    #         )
+    #
+    #         log_comment = f"{comment} | batch={batch_idx}" if comment else f"batch={batch_idx}"
+    #         _save_pca_log(log_path, explained_variance_ratio, cumulative_variance, log_comment)
+    #         print(f"\t * Saved PCA point-cloud image to {image_path}.")
+    #         print(f"\t * Saved PCA point-cloud data to {npz_path}.")
+    #     print(f"\t * Saved PCA statistics to {log_path}.")
 
     def _forward_with_features(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> Tuple[
         torch.Tensor, Dict[str, torch.Tensor]]:
@@ -165,6 +420,10 @@ class FlowEulerSampler(Sampler):
         _, up_ft_cur_dict = self._forward_with_features(latent, t, cond)
         # print("up_ft_cur_dict:", up_ft_cur_dict.grad_fn)
 
+        step_tag = float(t) if not torch.is_tensor(t) else float(t[0].item() / 1000.0)
+        # self._save_hook_feature_grid(up_ft_tar_dict, step_tag=step_tag, source_tag="tar")
+        # self._save_hook_feature_grid(up_ft_cur_dict, step_tag=step_tag, source_tag="cur")
+
         # 17 18层 或者
         feature_keys = sorted(k for k in up_ft_tar_dict.keys() if k in up_ft_index)
         if len(feature_keys) == 0:
@@ -192,6 +451,18 @@ class FlowEulerSampler(Sampler):
             #     cur_ft = F.interpolate(cur_ft, size=target_size, mode="trilinear", align_corners=False)
             up_ft_tar.append(tar_ft)
             up_ft_cur.append(cur_ft)
+
+            step_tag = float(t) if not torch.is_tensor(t) else float(t[0].item() / 1000.0)
+            # self._visualize_pca_feature_pointcloud(
+            #     cur_ft.detach(),
+            #     comment=f"cur_{key}_t{step_tag:.4f}"
+            # )
+            # self._visualize_pca_feature_pointcloud(
+            #     tar_ft.detach(),
+            #     comment=f"tar_{key}_t{step_tag:.4f}"
+            # )
+
+
 
         # 使用和latent相同的device和dtype
         loss_edit = 0
@@ -255,7 +526,7 @@ class FlowEulerSampler(Sampler):
 
         # 定义的编辑区域的mask 需要resize成cond_grad_edit的形状（latent的形状）
         mask = _resize_mask(mask_x0, cond_grad_edit.shape[-3:], latent.dtype)
-        guidance = cond_grad_edit.detach() * 4e-2 * mask + cond_grad_con.detach() * 4e-2 * (1 - mask)
+        guidance = cond_grad_edit.detach() * 1e4 * mask + cond_grad_con.detach() * 1e4 * (1 - mask)
         self.estimator.zero_grad()
         # guidance维度 b c r r r
         # 预测的v是b c r r r
@@ -304,17 +575,43 @@ class FlowEulerSampler(Sampler):
         with torch.no_grad():
             pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
 
-        with torch.enable_grad():
-            guidance = self.compute_guidance(
-                mask_x0,
-                mask_cur,
-                mask_tar,
-                mask_other,
-                latent,
-                latent_noise_ref,
-                t,
-                cond
+        guidance = 0.0
+
+        # 只在前 3/5 的采样过程中计算 guidance
+        if i < int(50 * 3 / 5):
+            with torch.enable_grad():
+                guidance = self.compute_guidance(
+                    mask_x0,
+                    mask_cur,
+                    mask_tar,
+                    mask_other,
+                    latent,
+                    latent_noise_ref,
+                    t,
+                    cond
+                )
+
+        def stat(name, x):
+            if isinstance(x, float) or isinstance(x, int):
+                print(f"{name}: scalar = {x}")
+                return
+
+            x_detach = x.detach()
+            print(
+                f"{name}: "
+                f"shape={tuple(x_detach.shape)}, "
+                f"mean={x_detach.mean().item():.6e}, "
+                f"abs_mean={x_detach.abs().mean().item():.6e}, "
+                f"norm={x_detach.norm().item():.6e}, "
+                f"max_abs={x_detach.abs().max().item():.6e}"
             )
+
+        stat("pred_v", pred_v)
+        stat("guidance", guidance)
+
+        if not isinstance(guidance, float):
+            ratio = guidance.detach().norm() / (pred_v.detach().norm() + 1e-12)
+            print(f"guidance / pred_v norm ratio: {ratio.item():.6e}")
 
         pred_x_prev = x_t - (t - t_prev) * (pred_v + guidance)
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
