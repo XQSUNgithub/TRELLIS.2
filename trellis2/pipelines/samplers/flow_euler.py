@@ -532,6 +532,212 @@ class FlowEulerSampler(Sampler):
         # 预测的v是b c r r r
         return guidance
 
+    def sde_once(
+            self,
+            model,
+            x_t,
+            t: float,
+            t_prev: float,
+            i: int,
+            cond: Optional[Any] = None,
+            **kwargs
+    ):
+        """
+        Sample x_{t-1} using Euler / Euler-Maruyama.
+
+        ODE mode:
+            x_{t_prev} = x_t - (t - t_prev) * u
+
+        SDE mode:
+            dX_t = [
+                (1 - sigma_t^2 * (1 - t) / (2t)) * u_t(X_t)
+                - sigma_t^2 / (2t) * X_t
+            ] dt + sigma_t dW_t
+
+        where:
+            u = pred_v + guidance
+        """
+
+        latent = x_t
+        latent_noise_ref = kwargs.get("latent_noise_ref")[-(i + 1)]
+
+        mask_x0 = kwargs.get("mask_x0")
+        mask_cur = kwargs.get("mask_cur")
+        mask_tar = kwargs.get("mask_tar")
+        mask_other = kwargs.get("mask_other")
+
+        # 可选参数
+        SDE_strength = 0.4
+        SDE_strength_un = 0.0
+        alg = "D+"
+
+        # 是否只在局部区域加 SDE
+        use_regional_sde = True
+
+        for key in [
+            "latent_noise_ref",
+            "mask_x0",
+            "mask_cur",
+            "mask_tar",
+            "mask_other"
+        ]:
+            kwargs.pop(key, None)
+
+        with torch.no_grad():
+            pred_x_0, pred_eps, pred_v = self._get_model_prediction(
+                model, x_t, t, cond, **kwargs
+            )
+
+        guidance = 0.0
+
+        # 只在前 3/5 的采样过程中计算 guidance
+        if i < 9:
+            with torch.enable_grad():
+                guidance = self.compute_guidance(
+                    mask_x0,
+                    mask_cur,
+                    mask_tar,
+                    mask_other,
+                    latent,
+                    latent_noise_ref,
+                    t,
+                    cond
+                )
+
+        def stat(name, x):
+            if isinstance(x, float) or isinstance(x, int):
+                print(f"{name}: scalar = {x}")
+                return
+
+            x_detach = x.detach()
+            print(
+                f"{name}: "
+                f"shape={tuple(x_detach.shape)}, "
+                f"mean={x_detach.mean().item():.6e}, "
+                f"abs_mean={x_detach.abs().mean().item():.6e}, "
+                f"norm={x_detach.norm().item():.6e}, "
+                f"max_abs={x_detach.abs().max().item():.6e}"
+            )
+
+        stat("pred_v", pred_v)
+        stat("guidance", guidance)
+
+        if not isinstance(guidance, float):
+            ratio = guidance.detach().norm() / (pred_v.detach().norm() + 1e-12)
+            print(f"guidance / pred_v norm ratio: {ratio.item():.6e}")
+
+        # ---------------------------------------------------------
+        # 1. 构造 velocity / vector field
+        # ---------------------------------------------------------
+        u = pred_v + guidance
+
+        # t, t_prev 可能是 float，也可能是 tensor，这里统一成 tensor
+        if not torch.is_tensor(t):
+            t_tensor = torch.tensor(t, device=x_t.device, dtype=x_t.dtype)
+        else:
+            t_tensor = t.to(device=x_t.device, dtype=x_t.dtype)
+
+        if not torch.is_tensor(t_prev):
+            t_prev_tensor = torch.tensor(t_prev, device=x_t.device, dtype=x_t.dtype)
+        else:
+            t_prev_tensor = t_prev.to(device=x_t.device, dtype=x_t.dtype)
+
+        # 从 t 走到 t_prev，一般 t_prev < t
+        dt = t_prev_tensor - t_tensor
+        delta_t = t_tensor - t_prev_tensor
+
+        # 防止 t 太接近 0 时除零
+        eps = torch.tensor(1e-5, device=x_t.device, dtype=x_t.dtype)
+        t_safe = torch.clamp(t_tensor, min=eps)
+
+        # ---------------------------------------------------------
+        # 2. 仿照原代码逻辑：只在 10 < i < 20 时启用 SDE
+        # ---------------------------------------------------------
+        if 3 < i < 6:
+            eta_un = SDE_strength_un
+            eta_rd = SDE_strength
+        else:
+            eta_un = 0.0
+            eta_rd = 0.0
+
+        # ---------------------------------------------------------
+        # 3. 默认 ODE step
+        #    sigma = 0 时，公式退化为：
+        #    x_prev = x_t - (t - t_prev) * u
+        # ---------------------------------------------------------
+        pred_x_prev_ode = x_t - delta_t * u
+
+        # ---------------------------------------------------------
+        # 4. SDE step
+        # ---------------------------------------------------------
+        if (eta_rd > 0 or eta_un > 0) and alg == "D+":
+            # sigma_t
+            #
+            # 这里先采用和你之前代码一致的设计：
+            # - 非编辑区域使用 eta_un
+            # - 编辑区域使用 eta_rd
+            #
+            # 如果你不想区分区域，可以直接令 sigma_t = eta_rd。
+            sigma_un = torch.tensor(eta_un, device=x_t.device, dtype=x_t.dtype)
+            sigma_rd = torch.tensor(eta_rd, device=x_t.device, dtype=x_t.dtype)
+
+            def sde_step_with_sigma(sigma_t):
+                sigma2 = sigma_t ** 2
+
+                drift = (
+                        (1.0 - sigma2 * (1.0 - t_safe) / (2.0 * t_safe)) * u
+                        - sigma2 / (2.0 * t_safe) * x_t
+                )
+
+                noise = torch.randn_like(x_t)
+                diffusion = sigma_t * torch.sqrt(torch.clamp(delta_t, min=0.0)) * noise
+
+                # 因为是从 t 积分到 t_prev，所以 drift 乘 dt = t_prev - t
+                return x_t + drift * dt + diffusion
+
+            pred_x_prev_un = sde_step_with_sigma(sigma_un)
+            pred_x_prev_rd = sde_step_with_sigma(sigma_rd)
+
+            if use_regional_sde:
+                # 优先使用 mask_other，因为你注释里说它和 latent 尺寸一致：
+                # mask_other: b c 16 16 16
+                if mask_other is not None:
+                    mask = mask_other.to(device=x_t.device, dtype=x_t.dtype)
+
+                    # 如果 mask 没有 channel 维，补到和 x_t 可广播
+                    while mask.ndim < x_t.ndim:
+                        mask = mask.unsqueeze(1)
+
+                    if mask.shape[-len(x_t.shape[2:]):] != x_t.shape[2:]:
+                        mask = F.interpolate(
+                            mask.float(),
+                            size=x_t.shape[2:],
+                            mode="nearest"
+                        ).to(dtype=x_t.dtype)
+
+                    mask = (mask > 0).to(dtype=x_t.dtype)
+                else:
+                    # 如果没有 mask，就退化为全局 SDE
+                    mask = torch.ones_like(x_t)
+
+                # 区域 SDE：
+                # - mask 区域使用 sigma_rd
+                # - 非 mask 区域使用 sigma_un
+                pred_x_prev = pred_x_prev_un * (1.0 - mask) + pred_x_prev_rd * mask
+
+            else:
+                # 全局 SDE
+                pred_x_prev = pred_x_prev_rd
+
+        else:
+            # 没有 SDE 时，完全保持原来的 ODE 更新
+            pred_x_prev = pred_x_prev_ode
+
+        return edict({
+            "pred_x_prev": pred_x_prev,
+            "pred_x_0": pred_x_0
+        })
+
     def edit_once(
             self,
             model,
@@ -578,7 +784,7 @@ class FlowEulerSampler(Sampler):
         guidance = 0.0
 
         # 只在前 3/5 的采样过程中计算 guidance
-        if i < int(50 * 3 / 5):
+        if i < 9:
             with torch.enable_grad():
                 guidance = self.compute_guidance(
                     mask_x0,
