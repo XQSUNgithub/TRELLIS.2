@@ -425,7 +425,7 @@ class FlowEulerSampler(Sampler):
         # self._save_hook_feature_grid(up_ft_cur_dict, step_tag=step_tag, source_tag="cur")
 
         # 17 18层 或者
-        feature_keys = sorted(k for k in up_ft_tar_dict.keys() if k in up_ft_index)
+        feature_keys = sorted(k for k in up_ft_tar_dict.keys())
         if len(feature_keys) == 0:
             raise ValueError("SparseStructureFlowModelWithFeatures did not return any features.")
 
@@ -488,6 +488,14 @@ class FlowEulerSampler(Sampler):
 
                 mask_overlap = ((cur_mask.float() + tar_mask.float()) > 1.5).float()
                 mask_non_overlap = (tar_mask.float() - mask_overlap) > 0.5
+                mask_overlap_pos = (mask_overlap == 1).nonzero(as_tuple=False)
+                mask_non_overlap_pos = mask_non_overlap.nonzero(as_tuple=False)
+
+                # print("mask_overlap == 1 positions:")
+                # print(mask_overlap_pos)
+
+                # print("mask_non_overlap == True positions:")
+                # print(mask_non_overlap_pos)
 
                 up_ft_cur_non_overlap = up_ft_cur[f_id][
                     mask_non_overlap.repeat(1, up_ft_cur[f_id].shape[1], 1, 1, 1)].view(up_ft_cur[f_id].shape[1],
@@ -567,7 +575,7 @@ class FlowEulerSampler(Sampler):
         mask_other = kwargs.get("mask_other")
 
         # 可选参数
-        SDE_strength = 0.4
+        SDE_strength = 4
         SDE_strength_un = 0.0
         alg = "D+"
 
@@ -702,19 +710,7 @@ class FlowEulerSampler(Sampler):
                 # 优先使用 mask_other，因为你注释里说它和 latent 尺寸一致：
                 # mask_other: b c 16 16 16
                 if mask_other is not None:
-                    mask = mask_other.to(device=x_t.device, dtype=x_t.dtype)
-
-                    # 如果 mask 没有 channel 维，补到和 x_t 可广播
-                    while mask.ndim < x_t.ndim:
-                        mask = mask.unsqueeze(1)
-
-                    if mask.shape[-len(x_t.shape[2:]):] != x_t.shape[2:]:
-                        mask = F.interpolate(
-                            mask.float(),
-                            size=x_t.shape[2:],
-                            mode="nearest"
-                        ).to(dtype=x_t.dtype)
-
+                    mask = F.interpolate(mask_x0[None, None].float(), size=x_t.shape[2:], mode="nearest").to(device=x_t.device, dtype=x_t.dtype)
                     mask = (mask > 0).to(dtype=x_t.dtype)
                 else:
                     # 如果没有 mask，就退化为全局 SDE
@@ -768,7 +764,7 @@ class FlowEulerSampler(Sampler):
         """
 
         latent = x_t
-        latent_noise_ref = kwargs.get("latent_noise_ref")[-(i + 1)]
+        latent_noise_ref = kwargs.get("latent_noise_ref")[-(i+1)]
 
         mask_x0 = kwargs.get("mask_x0")  # 编辑区域 d w h 16
         mask_cur = kwargs.get("mask_cur")  # target region

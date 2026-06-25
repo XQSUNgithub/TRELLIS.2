@@ -10,6 +10,7 @@ from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
 import trimesh
 
+
 class Trellis2ImageTo3DEditPipeline(Pipeline):
     """
     Pipeline for inferring Trellis2 image-to-3D models.
@@ -242,44 +243,6 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
-        coords0 = coords[coords[:, 0] == 0][:, 1:].cpu().numpy()
-        coords0 = coords0[:, [2, 0, 1]]
-        coords0 = coords0[:, [1, 2, 0]] # (x, y, z)
-
-        # Convert voxel coordinates to point cloud
-        points = coords0.astype(np.float32)
-
-        # 打印点云坐标系范围
-        mins = points.min(axis=0)
-        maxs = points.max(axis=0)
-
-        print("Point cloud coordinate range:")
-        print(f"x: [{mins[0]}, {maxs[0]}]")
-        print(f"y: [{mins[1]}, {maxs[1]}]")
-        print(f"z: [{mins[2]}, {maxs[2]}]")
-
-        # 打印点云最高点坐标
-        highest_idx = np.argmax(points[:, 2])
-        highest_point = points[highest_idx]
-
-        print("Highest point coordinate:")
-        print(f"(x, y, z) = ({highest_point[0]}, {highest_point[1]}, {highest_point[2]})")
-
-        # # Map xyz coordinates to RGB values in [0, 255]
-        # ranges = np.maximum(maxs - mins, 1e-6)
-        #
-        # rgb = ((points - mins) / ranges * 255).astype(np.uint8)
-        #
-        # # RGBA colors
-        # colors = np.concatenate(
-        #     [rgb, np.full((rgb.shape[0], 1), 255, dtype=np.uint8)],
-        #     axis=1,
-        # )
-        #
-        # point_cloud = trimesh.points.PointCloud(vertices=points, colors=colors)
-        #
-        # point_cloud.export("inversionvoxels_pointcloud.glb")
-
         return coords
 
     def edit_sparse_structure(
@@ -287,7 +250,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             cond: dict,
             resolution: int,
             num_samples: int = 1,
-            latent_noise_ref: list =[],
+            latent_noise_ref: list = [],
             sampler_params: dict = {},
             init_noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -315,61 +278,53 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         # mask_cur = kwargs.get("mask_cur")
         # mask_tar = kwargs.get("mask_tar")
         # mask_other = kwargs.get("mask_other")
-
         reso = 16
 
-        idx_32 = torch.tensor([12, 13, 27], device=self.device)
-        idx_16 = idx_32 // 2
+        idx_16 = torch.tensor([8, 0, 9], device=self.device)
+        # idx_16 = idx_32 // 2
 
         x, y, z = idx_16.tolist()
 
-        cube_size = 4
-        r = cube_size // 2  # 1
+        # cube_size = 4
+        # r = cube_size // 2  # 1
 
-        x0, x1 = x - r, x + r + 1
-        y0, y1 = y - r, y + r + 1
-        z0, z1 = z - r, z + r + 1
+        x0, x1 = x - 1, x + 1
+        y0, y1 = y, y + 2
+        z0, z1 = z - 1, z + 1
+
+        # x0, x1 = x , x+1
+        # y0, y1 = y , y+1
+        # z0, z1 = z , z+1
+
+        # x0, x1 = x - r, x + r + 1
+        # y0, y1 = y - r, y + r + 1
+        # z0, z1 = z - r, z + r + 1
 
         h = reso
-        base_cur = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        base_tar = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
+        base_cur0 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
+        base_cur1 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
+        base_tar0 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
+        base_tar1 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
         base_x0 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
         base_other = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        base_cur[x0-2:x1-2, y0:y1, z0:z1] = 1 # 用在target noise上，实际是cur区域
-        base_tar[x0:x1, y0:y1, z0:z1] = 1
-        # 编辑区域：cur 和 tar 的共同编辑范围，准确说是并集
-        base_x0 = torch.clamp(base_cur + base_tar, 0, 1)
+        base_cur0[x0:x1, y0:y1, z0 + 2:z1 + 2] = 1  # 用在target noise上，实际是cur区域
+        base_cur1[x0:x1, y0:y1, z0 - 2:z1 - 2] = 1  # 用在target noise上，实际是cur区域
+        base_tar0[x0:x1, y0:y1, z0:z1] = 1
+        base_tar1[x0:x1, y0:y1, z0:z1] = 1
+        # 编辑区域：cur 和 tar 的共同编辑范围
+        base_x0[0:16, 0:3, 8:12] = 1
         # 未编辑区域
         base_other = 1 - base_x0
-        noise[x0-2:x1-2, y0:y1, z0:z1] = noise[x0:x1, y0:y1, z0:z1].clone()
-
-        # h = reso
-        # h_1_8 = h // 8
-        # h_1_4 = h // 4
-        # base_cur = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        # base_tar = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        # base_x0 = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        # base_other = torch.zeros(h, h, h, device=self.device, dtype=noise.dtype)
-        # base_cur[:, :, :h_1_8] = 1 # 用在target noise上，实际是cur区域
-        # base_tar[:, :, h_1_8:h_1_4] = 1
-        # base_x0[:, :, :h_1_4] = 1
-        # base_other[:, :, h_1_4:] = 1
-        # noise[:, :, :, :, :h_1_8] = noise[:, :, :, :, h_1_8:h_1_4].clone()
-
-        # base_cur[:, :h_1_8, :] = 1 # 用在target noise上，实际是cur区域
-        # base_tar[:, h_1_8:h_1_4, :] = 1
-        # base_x0[:, :h_1_4, :] = 1
-        # base_other[:, h_1_4:, :] = 1
-
-        # base_cur[:h_1_8] = 1 # 用在target noise上，实际是cur区域
-        # base_tar[h_1_8:h_1_4] = 1
-        # base_x0[:h_1_4] = 1
-        # base_other[h_1_4:] = 1
-
+        noiseRandom = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        noiseStore = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        noiseStore[:, :, x0:x1, y0:y1, z0:z1] = noise[:, :, x0:x1, y0:y1, z0:z1].clone()
+        # noise[:, :, x0-3:x1+3, y0-8:y1, z0-5:z1+2] = noiseRandom[:, :, x0-3:x1+3, y0-8:y1, z0-5:z1+2].clone()
+        noise[:, :, x0:x1, y0:y1, z0 + 2:z1 + 2] = noiseStore[:, :, x0:x1, y0:y1, z0:z1].clone()
+        noise[:, :, x0:x1, y0:y1, z0 - 2:z1 - 2] = noiseStore[:, :, x0:x1, y0:y1, z0:z1].clone()
 
         mask_x0 = base_x0
-        mask_cur = [base_cur]
-        mask_tar = [base_tar]
+        mask_cur = [base_cur0, base_cur1]
+        mask_tar = [base_tar0, base_tar1]
         mask_other = base_other
 
         sampler_params["mask_x0"] = mask_x0
@@ -401,14 +356,13 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             decoder.cpu()
         if resolution != decoded.shape[2]:
             ratio = decoded.shape[2] // resolution
-            decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5 #变成32
-
+            decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5  # 变成32
 
         coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
 
         coords0 = coords[coords[:, 0] == 0][:, 1:].cpu().numpy()
         coords0 = coords0[:, [2, 0, 1]]
-        coords0 = coords0[:, [1, 2, 0]] # (x, y, z)
+        coords0 = coords0[:, [1, 2, 0]]  # (x, y, z)
 
         # Convert voxel coordinates to point cloud
         points = coords0.astype(np.float32)
@@ -479,7 +433,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         inv_sampler_params.setdefault('guidance_strength', 1.0)
         if self.low_vram:
             flow_model.to(self.device)
-            #TODO 实际没有进行cfg 因为没有在最外层的sampler里写inverse_sample
+            # TODO 实际没有进行cfg 因为没有在最外层的sampler里写inverse_sample
         rets = self.sparse_structure_sampler.inverse_sample(
             flow_model,
             sparse_structure_latent.to(self.device),
@@ -492,12 +446,69 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             flow_model.cpu()
         return rets
 
+    @torch.no_grad()
+    def load_shape_slat_latent(
+            self,
+            latent_path: str,
+    ) -> SparseTensor:
+        """
+        Load shape SLat latent from npz file.
+
+        Args:
+            latent_path (str): Path to a shape latent npz file that contains keys 'coords' and 'feats'.
+        """
+        latent = np.load(latent_path)
+        assert 'coords' in latent and 'feats' in latent, \
+            f"Invalid shape SLat latent file (missing 'coords' or 'feats'): {latent_path}"
+        coords = torch.tensor(latent['coords']).int()
+        feats = torch.tensor(latent['feats']).float()
+        if coords.ndim != 2 or coords.shape[1] not in (3, 4):
+            raise ValueError(f"Invalid shape SLat coords shape: {coords.shape}")
+        if coords.shape[1] == 3:
+            coords = torch.cat([torch.zeros_like(coords)[:, :1], coords], dim=1)
+        return SparseTensor(feats=feats, coords=coords)
+
+    @torch.no_grad()
+    def invert_shape_slat_latent(
+            self,
+            cond: dict,
+            flow_model,
+            shape_slat_latent: SparseTensor,
+            sampler_params: dict = {},
+    ) -> SparseTensor:
+        """
+        Invert an unnormalized shape SLat x_0 to noise by integrating from t=0 to t=1.
+        """
+
+        shape_slat_latent = shape_slat_latent.to(self.device)
+        shape_slat_latent.clear_spatial_cache()
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(shape_slat_latent.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(shape_slat_latent.device)
+        shape_slat_latent = (shape_slat_latent - mean) / std
+
+        inv_sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
+        inv_sampler_params.setdefault('guidance_strength', 1.0)
+        if self.low_vram:
+            flow_model.to(self.device)
+        eps_hat = self.shape_slat_sampler.inverse_sample(
+            flow_model,
+            shape_slat_latent.to(self.device),
+            **cond,
+            **inv_sampler_params,
+            verbose=True,
+            tqdm_desc="Inverting shape SLat",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+        return eps_hat
+
     def sample_shape_slat(
             self,
             cond: dict,
             flow_model,
             coords: torch.Tensor,
             sampler_params: dict = {},
+            init_noise: Optional[SparseTensor] = None,
     ) -> SparseTensor:
         """
         Sample structured latent with the given conditioning.
@@ -508,10 +519,17 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             sampler_params (dict): Additional parameters for the sampler.
         """
         # Sample structured latent
-        noise = SparseTensor(
-            feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
-            coords=coords,
-        )
+        if init_noise is None:
+            noise = SparseTensor(
+                feats=torch.randn(coords.shape[0], flow_model.in_channels).to(self.device),
+                coords=coords,
+            )
+        else:
+            noise = init_noise.to(self.device)
+            noise.clear_spatial_cache()
+            coords = noise.coords
+            assert noise.feats.shape[
+                       1] == flow_model.in_channels, f"Invalid init_noise feature shape: {noise.feats.shape}"
         sampler_params = {**self.shape_slat_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
@@ -744,8 +762,6 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             )
         return out_mesh
 
-
-
     # def visualize_decoded(decoded, batch_idx=0, channel_idx=0, mode="scatter"):
     #     """
     #     decoded: (B, C, R, R, R), bool or 0/1 tensor
@@ -790,6 +806,70 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
     #     else:
     #         raise ValueError("mode must be one of: scatter, voxels, slices")
 
+    @staticmethod
+    def _coords_to_keys(coords: torch.Tensor, spatial_shape: torch.Tensor) -> torch.Tensor:
+        spatial_shape = spatial_shape.to(coords.device, dtype=coords.dtype)
+        return (((coords[:, 0] * spatial_shape[0] + coords[:, 1]) * spatial_shape[1] + coords[:, 2]) * spatial_shape[2] + coords[:, 3])
+
+    # 2个条件 找到同一位置且都激活的latent 且是非编辑区域 替换成对应位置的latent
+    @torch.no_grad()
+    def merge_shape_slat_init_noise(
+        self,
+        coords: torch.Tensor,
+        inverted_noise: SparseTensor,
+        flow_model,
+        edit_mask: Optional[torch.Tensor] = None,
+    ) -> SparseTensor:
+        """
+        Build shape SLat init noise on sampled sparse-structure coords.
+
+        Inverted features are copied to matching non-edit coordinates. Edit-mask coordinates and
+        sampled coordinates missing from the inverted latent keep random-noise features.
+        """
+
+        # compute guidance时也需要Build shape SLat init noise on sampled sparse-structure coords.
+        # 然后用缓存的latent（展开成volume 并build noise）和dit中间层的latent（展开成volume）算guidance
+        coords = coords.to(self.device)
+        inverted_noise = inverted_noise.to(self.device)
+        inverted_noise.clear_spatial_cache()
+        feats = torch.randn(coords.shape[0], flow_model.in_channels).to(self.device)
+
+        spatial_shape = torch.maximum(
+            coords[:, 1:].max(dim=0).values,
+            inverted_noise.coords[:, 1:].max(dim=0).values,
+        ) + 1
+        dst_keys = self._coords_to_keys(coords.long(), spatial_shape.long())
+        src_keys = self._coords_to_keys(inverted_noise.coords.long(), spatial_shape.long())
+        sort_idx = torch.argsort(src_keys)
+        src_keys = src_keys[sort_idx]
+        src_feats = inverted_noise.feats[sort_idx]
+
+        insert_pos = torch.searchsorted(src_keys, dst_keys)
+        # 两个coords都存在的地方
+        has_src = (insert_pos < src_keys.shape[0]) & (src_keys[insert_pos.clamp(max=src_keys.shape[0] - 1)] == dst_keys)
+
+        if edit_mask is None:
+            non_edit = torch.ones(coords.shape[0], dtype=torch.bool, device=self.device)
+        else:
+            edit_mask = edit_mask.to(self.device).bool()
+            while edit_mask.ndim > 4 and edit_mask.shape[1] == 1:
+                edit_mask = edit_mask[:, 0]
+            if edit_mask.ndim == 3:
+                # coords有n个点 第0个点从mask中取状态（是否编辑）
+                # 使用coords拿到编辑区域的sparse coord索引
+                # 注意mask形状和coords坐标范围一致 32*32*32
+                edit = edit_mask[coords[:, 1].long(), coords[:, 2].long(), coords[:, 3].long()]
+            elif edit_mask.ndim == 4:
+                edit = edit_mask[coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long(), coords[:, 3].long()]
+            else:
+                raise ValueError(f"Invalid shape SLat edit mask shape: {edit_mask.shape}")
+            non_edit = ~edit
+
+        # 对于edited coords来说 在是非编辑区域且coords编辑前后的volume同一位置都激活的区域 替换
+        replace = has_src & non_edit
+        feats[replace] = src_feats[insert_pos[replace]]
+        return SparseTensor(feats=feats, coords=coords)
+
     @torch.no_grad()
     def run(
             self,
@@ -807,6 +887,10 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             sparse_structure_latent_path: Optional[str] = None,
             use_sparse_structure_inversion: bool = False,
             sparse_structure_inversion_sampler_params: dict = {},
+            shape_slat_latent: Optional[SparseTensor] = None,
+            shape_slat_latent_path: Optional[str] = None,
+            use_shape_slat_inversion: bool = False,
+            shape_slat_inversion_sampler_params: dict = {},
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -859,7 +943,7 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
                 "Provide exactly one of sparse_structure_latent or sparse_structure_latent_path when use_sparse_structure_inversion=True"
             if sparse_structure_latent is None:
                 sparse_structure_latent = self.load_sparse_structure_latent(sparse_structure_latent_path)
-
+                sparse_structure_latent = sparse_structure_latent.to(self.device)
 
             decoder = self.models['sparse_structure_decoder']
             if self.low_vram:
@@ -896,39 +980,61 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
             print("RawHighest point coordinate:")
             print(f"(x, y, z) = ({highest_point[0]}, {highest_point[1]}, {highest_point[2]})")
 
-            # # Map xyz coordinates to RGB values in [0, 255]
-            # ranges = np.maximum(maxs - mins, 1e-6)
-            #
-            # rgb = ((points - mins) / ranges * 255).astype(np.uint8)
-            #
-            # # RGBA colors
-            # colors = np.concatenate(
-            #     [rgb, np.full((rgb.shape[0], 1), 255, dtype=np.uint8)],
-            #     axis=1,
-            # )
-            #
-            # point_cloud = trimesh.points.PointCloud(vertices=points, colors=colors)
-            #
-            # point_cloud.export("Rawvoxels_pointcloud.glb")
+            # Map xyz coordinates to RGB values in [0, 255]
+            ranges = np.maximum(maxs - mins, 1e-6)
+
+            rgb = ((points - mins) / ranges * 255).astype(np.uint8)
+
+            # RGBA colors
+            colors = np.concatenate(
+                [rgb, np.full((rgb.shape[0], 1), 255, dtype=np.uint8)],
+                axis=1,
+            )
+
+            point_cloud = trimesh.points.PointCloud(vertices=points, colors=colors)
+
+            point_cloud.export("Rawvoxels_pointcloud.glb")
 
             rets = self.invert_sparse_structure_latent(
                 cond_512,
                 sparse_structure_latent,
                 sparse_structure_inversion_sampler_params,
             )
-            ss_init_noise=rets.samples
-            #sparse_structure_sampler_params["latent_noise_ref"] = rets.pred_x_t
+            ss_init_noise = rets.samples
+            # sparse_structure_sampler_params["latent_noise_ref"] = rets.pred_x_t
             latent_noise_ref = rets.pred_x_t
             if not rets.pred_x_t:
-              raise ValueError(f"Invalid pred_x_t: {rets}")
+                raise ValueError(f"Invalid pred_x_t: {rets}")
 
         coords = self.edit_sparse_structure(
             cond_512, ss_res,
             num_samples, latent_noise_ref, sparse_structure_sampler_params,
             init_noise=ss_init_noise,
         )
-        # coords可视化
+        # coords = None
 
+        shape_slat_init_noise = None
+        if use_shape_slat_inversion and pipeline_type == '512':
+            assert (shape_slat_latent is not None) ^ (shape_slat_latent_path is not None), \
+                "Provide exactly one of shape_slat_latent or shape_slat_latent_path when use_shape_slat_inversion=True"
+            if shape_slat_latent is None:
+                shape_slat_latent = self.load_shape_slat_latent(shape_slat_latent_path)
+                # 只invert feats的部分
+            inverted_shape_slat_noise = self.invert_shape_slat_latent(
+                cond_512,
+                self.models['shape_slat_flow_model_512'],
+                shape_slat_latent,
+                shape_slat_inversion_sampler_params,
+            )
+
+            shape_slat_init_noise = self.merge_shape_slat_init_noise(
+                coords,
+                inverted_shape_slat_noise,
+                self.models['shape_slat_flow_model_512'],
+                shape_slat_edit_mask,
+            )
+
+        # coords可视化
 
         # _ = self.sample_sparse_structure(
         #     cond_512, ss_res,
@@ -939,7 +1045,8 @@ class Trellis2ImageTo3DEditPipeline(Pipeline):
         if pipeline_type == '512':
             shape_slat = self.sample_shape_slat(
                 cond_512, self.models['shape_slat_flow_model_512'],
-                coords, shape_slat_sampler_params
+                coords, shape_slat_sampler_params,
+                init_noise=shape_slat_init_noise,
             )
             tex_slat = self.sample_tex_slat(
                 cond_512, self.models['tex_slat_flow_model_512'],
